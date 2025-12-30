@@ -1,21 +1,5 @@
--- Tambahkan di awal script untuk baseline CPU timing
-local cpuSamples = {}
-local startTime = tick()
-task.spawn(function()
-    while tick() - startTime < 60 do -- 60 detik sampling
-        table.insert(cpuSamples, {
-            time = tick() - startTime,
-            fps = 1/game:GetService("RunService").Heartbeat:Wait()
-        })
-        task.wait(1)
-    end
-    -- Print results
-    local total = 0
-    for _, s in ipairs(cpuSamples) do total = total + s.fps end
-    print(string.format("[CPU] Avg FPS: %.1f, Samples: %d", total/#cpuSamples, #cpuSamples))
-end)
 --[[
-    ZlaVe Script v2.5
+    ZlaVe Script v2.9
     ==============================
     by Minervastra
     
@@ -207,6 +191,10 @@ local SavedSettings = {
     -- v2.4: Auto Consume Potion
     autoPotionEnabled = false,
     selectedPotions = {}, -- Multi-select potion list
+    -- v2.8: Auto Ruin Door
+    autoRuinDoorEnabled = false,
+    -- v2.9: Auto Gift Santa
+    autoGiftSantaEnabled = false,
 }
 
 local function LoadSettings()
@@ -297,6 +285,10 @@ pcall(function()
     Remotes.RF_EquipOxygenTank = Net:WaitForChild("RF/EquipOxygenTank", 2)
     Remotes.RF_UnequipOxygenTank = Net:WaitForChild("RF/UnequipOxygenTank", 2)
     Remotes.RF_ConsumePotion = Net:WaitForChild("RF/ConsumePotion", 2)
+    -- v2.9: Gift Santa remotes
+    Remotes.RF_RedeemGift = Net:WaitForChild("RF/RedeemGift", 2)
+    Remotes.RE_DialogueEnded = Net:WaitForChild("RE/DialogueEnded", 2)
+    Remotes.RE_EquipItem = Net:WaitForChild("RE/EquipItem", 2)
 end)
 
 -- Note: Use Remotes.RF_Charge, Remotes.RF_Request, etc. directly
@@ -388,9 +380,7 @@ end
 --====================================
 -- MODULE LOADING
 --====================================
-local Replion = nil
-local ItemUtility = nil
-local TierUtility = nil
+local Replion, ItemUtility, TierUtility = nil, nil, nil
 
 pcall(function()
     local packages = ReplicatedStorage:FindFirstChild("Packages")
@@ -612,13 +602,12 @@ local AutoFavoriteState = {
     unfavoriteThread = nil,
     unfavoriteRunning = false,
     fishConnection = nil,
-}
-
--- Mutation options (from yesbgt.lua line 2563-2568)
-local MUTATION_OPTIONS = {
-    "Shiny", "Gemstone", "Corrupt", "Galaxy", "Holographic", "Ghost",
-    "Lightning", "Fairy Dust", "Gold", "Midnight", "Radioactive",
-    "Stone", "Albino", "Sandy", "Acidic", "Disco", "Frozen", "Noob"
+    -- Mutation options (moved from standalone local to save register)
+    MUTATION_OPTIONS = {
+        "Shiny", "Gemstone", "Corrupt", "Galaxy", "Holographic", "Ghost",
+        "Lightning", "Fairy Dust", "Gold", "Midnight", "Radioactive",
+        "Stone", "Albino", "Sandy", "Acidic", "Disco", "Frozen", "Noob"
+    },
 }
 
 -- Get all item names from ReplicatedStorage.Items (use data.Data.Name for parity with GetFishNameAndRarity)
@@ -1197,9 +1186,13 @@ end
 -- UTILITY FEATURES (from inspired/yesbgt.lua)
 --====================================
 
--- Hide Notifications State
-local HideNotifState = {
-    connection = nil,
+-- UI Feature States (consolidated to save locals)
+local UIStates = {
+    HideNotif = { connection = nil },
+    NoAnimation = { active = false, originalAnimateEnabled = nil, charConnection = nil },
+    Cutscene = { enabled = false, remote = nil, connection = nil },
+    VFX = { enabled = false, controller = nil, originalHandle = nil },
+    Zoom = { enabled = false, originalMax = nil, connection = nil },
 }
 
 local function ApplyHideNotifications(state)
@@ -1215,27 +1208,20 @@ local function ApplyHideNotifications(state)
     if state then
         -- Set once, then use property listener to catch game re-enabling
         SmallNotification.Enabled = false
-        if HideNotifState.connection then HideNotifState.connection:Disconnect() end
-        HideNotifState.connection = SmallNotification:GetPropertyChangedSignal("Enabled"):Connect(function()
+        if UIStates.HideNotif.connection then UIStates.HideNotif.connection:Disconnect() end
+        UIStates.HideNotif.connection = SmallNotification:GetPropertyChangedSignal("Enabled"):Connect(function()
             if SavedSettings.hideNotifications and SmallNotification.Enabled then
                 SmallNotification.Enabled = false
             end
         end)
     else
-        if HideNotifState.connection then
-            HideNotifState.connection:Disconnect()
-            HideNotifState.connection = nil
+        if UIStates.HideNotif.connection then
+            UIStates.HideNotif.connection:Disconnect()
+            UIStates.HideNotif.connection = nil
         end
         SmallNotification.Enabled = true
     end
 end
-
--- No Animation State
-local NoAnimationState = {
-    active = false,
-    originalAnimateEnabled = nil,
-    charConnection = nil,
-}
 
 local function DisableAnimations()
     local character = LocalPlayer.Character
@@ -1247,7 +1233,7 @@ local function DisableAnimations()
     -- 1. Disable 'Animate' script
     local animateScript = character:FindFirstChild("Animate")
     if animateScript and animateScript:IsA("LocalScript") then
-        NoAnimationState.originalAnimateEnabled = animateScript.Enabled
+        UIStates.NoAnimation.originalAnimateEnabled = animateScript.Enabled
         animateScript.Enabled = false
     end
     
@@ -1269,8 +1255,8 @@ local function EnableAnimations()
     
     -- 1. Restore 'Animate' script
     local animateScript = character:FindFirstChild("Animate")
-    if animateScript and NoAnimationState.originalAnimateEnabled ~= nil then
-        animateScript.Enabled = NoAnimationState.originalAnimateEnabled
+    if animateScript and UIStates.NoAnimation.originalAnimateEnabled ~= nil then
+        animateScript.Enabled = UIStates.NoAnimation.originalAnimateEnabled
     end
     
     local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -1281,18 +1267,18 @@ local function EnableAnimations()
     if not existingAnimator then
         Instance.new("Animator").Parent = humanoid
     end
-    NoAnimationState.originalAnimateEnabled = nil
+    UIStates.NoAnimation.originalAnimateEnabled = nil
 end
 
 local function ApplyNoAnimation(state)
-    NoAnimationState.active = state
+    UIStates.NoAnimation.active = state
     
     if state then
         DisableAnimations()
         -- Connect to CharacterAdded for respawn
-        if not NoAnimationState.charConnection then
-            NoAnimationState.charConnection = LocalPlayer.CharacterAdded:Connect(function()
-                if NoAnimationState.active then
+        if not UIStates.NoAnimation.charConnection then
+            UIStates.NoAnimation.charConnection = LocalPlayer.CharacterAdded:Connect(function()
+                if UIStates.NoAnimation.active then
                     task.wait(0.2)
                     DisableAnimations()
                 end
@@ -1300,26 +1286,19 @@ local function ApplyNoAnimation(state)
         end
     else
         EnableAnimations()
-        if NoAnimationState.charConnection then
-            NoAnimationState.charConnection:Disconnect()
-            NoAnimationState.charConnection = nil
+        if UIStates.NoAnimation.charConnection then
+            UIStates.NoAnimation.charConnection:Disconnect()
+            UIStates.NoAnimation.charConnection = nil
         end
     end
 end
 
--- Block Cutscene State
-local CutsceneState = {
-    enabled = false,
-    remote = nil,
-    connection = nil,
-}
-
 local function SetupBlockCutscene()
     pcall(function()
-        CutsceneState.remote = Net:WaitForChild("RE/ReplicateCutscene", 5)
-        if CutsceneState.remote then
-            CutsceneState.connection = CutsceneState.remote.OnClientEvent:Connect(function(rarity, player, position, fishName, data)
-                if CutsceneState.enabled then
+        UIStates.Cutscene.remote = Net:WaitForChild("RE/ReplicateCutscene", 5)
+        if UIStates.Cutscene.remote then
+            UIStates.Cutscene.connection = UIStates.Cutscene.remote.OnClientEvent:Connect(function(rarity, player, position, fishName, data)
+                if UIStates.Cutscene.enabled then
                     if CONFIG.DEBUG then log("[Cutscene] Blocked: " .. tostring(fishName)) end
                     return nil
                 end
@@ -1329,19 +1308,12 @@ local function SetupBlockCutscene()
 end
 
 local function ApplyBlockCutscene(state)
-    CutsceneState.enabled = state
+    UIStates.Cutscene.enabled = state
     -- Setup connection if not already done
-    if not CutsceneState.connection then
+    if not UIStates.Cutscene.connection then
         SetupBlockCutscene()
     end
 end
-
--- Remove Skin Effect (VFX Controller)
-local VFXState = {
-    enabled = false,
-    controller = nil,
-    originalHandle = nil,
-}
 
 local function SetupVFXController()
     pcall(function()
@@ -1349,9 +1321,9 @@ local function SetupVFXController()
         if Controllers then
             local vfxModule = Controllers:FindFirstChild("VFXController")
             if vfxModule then
-                VFXState.controller = require(vfxModule)
-                if VFXState.controller and VFXState.controller.Handle then
-                    VFXState.originalHandle = VFXState.controller.Handle
+                UIStates.VFX.controller = require(vfxModule)
+                if UIStates.VFX.controller and UIStates.VFX.controller.Handle then
+                    UIStates.VFX.originalHandle = UIStates.VFX.controller.Handle
                 end
             end
         end
@@ -1359,20 +1331,20 @@ local function SetupVFXController()
 end
 
 local function ApplyRemoveSkinEffect(state)
-    VFXState.enabled = state
+    UIStates.VFX.enabled = state
     
     -- Setup if not done
-    if not VFXState.controller then
+    if not UIStates.VFX.controller then
         SetupVFXController()
     end
     
-    if not VFXState.controller then return end
+    if not UIStates.VFX.controller then return end
     
     if state then
         -- Block VFX functions
-        VFXState.controller.Handle = function(...) end
-        pcall(function() VFXState.controller.RenderAtPoint = function(...) end end)
-        pcall(function() VFXState.controller.RenderInstance = function(...) end end)
+        UIStates.VFX.controller.Handle = function(...) end
+        pcall(function() UIStates.VFX.controller.RenderAtPoint = function(...) end end)
+        pcall(function() UIStates.VFX.controller.RenderInstance = function(...) end end)
         
         -- Clear existing cosmetics
         local cosmeticFolder = Services.Workspace:FindFirstChild("CosmeticFolder")
@@ -1381,31 +1353,24 @@ local function ApplyRemoveSkinEffect(state)
         end
     else
         -- Restore original
-        if VFXState.originalHandle then
-            VFXState.controller.Handle = VFXState.originalHandle
+        if UIStates.VFX.originalHandle then
+            UIStates.VFX.controller.Handle = UIStates.VFX.originalHandle
         end
     end
 end
 
--- Infinite Zoom State
-local ZoomState = {
-    enabled = false,
-    originalMax = nil,
-    connection = nil,
-}
-
 local function ApplyInfiniteZoom(state)
-    ZoomState.enabled = state
+    UIStates.Zoom.enabled = state
     
     if state then
         -- Save original
-        ZoomState.originalMax = LocalPlayer.CameraMaxZoomDistance
+        UIStates.Zoom.originalMax = LocalPlayer.CameraMaxZoomDistance
         LocalPlayer.CameraMaxZoomDistance = 100000
         
         -- Throttled backup loop (game may reset it) - check every 2s instead of 60/s
-        if ZoomState.connection then ZoomState.connection:Disconnect() end
+        if UIStates.Zoom.connection then UIStates.Zoom.connection:Disconnect() end
         local lastZoomCheck = 0
-        ZoomState.connection = RunService.Heartbeat:Connect(function()
+        UIStates.Zoom.connection = RunService.Heartbeat:Connect(function()
             local now = tick()
             if now - lastZoomCheck < 2 then return end
             lastZoomCheck = now
@@ -1414,11 +1379,11 @@ local function ApplyInfiniteZoom(state)
             end
         end)
     else
-        if ZoomState.connection then
-            ZoomState.connection:Disconnect()
-            ZoomState.connection = nil
+        if UIStates.Zoom.connection then
+            UIStates.Zoom.connection:Disconnect()
+            UIStates.Zoom.connection = nil
         end
-        LocalPlayer.CameraMaxZoomDistance = ZoomState.originalMax or 128
+        LocalPlayer.CameraMaxZoomDistance = UIStates.Zoom.originalMax or 128
     end
 end
 
@@ -1719,8 +1684,8 @@ StopHeartbeat = function()
     })
     
     CleanupConnections()
-    FavoritedCache = {}
-    FavoritedCacheCount = 0
+    AutoFavoriteState.cache = {}
+    AutoFavoriteState.cacheCount = 0
 end
 
 --====================================
@@ -1739,6 +1704,8 @@ CONFIG.TELEPORT_LOCATIONS = {
     ["Sisyphus Statue"] = CFrame.new(-3712, -135, -1013),
     ["Treasure"] = CFrame.new(-3566, -279, -1681),
     ["Tropical"] = CFrame.new(-2093, 6, 3699),
+    ["First Altar"] = CFrame.new(3240, -1301, 1397),
+    ["Second Altar"] = CFrame.new(1479, 128, -603),
 }
 CONFIG.selectedTeleport = "Fisherman Island"
 
@@ -1782,6 +1749,931 @@ local EventState = {
 pcall(function()
     EventState.RUIN_DOOR = Services.Workspace:FindFirstChild("RUIN INTERACTIONS") and Services.Workspace["RUIN INTERACTIONS"]:FindFirstChild("Door")
 end)
+
+--====================================
+-- AUTO RUIN DOOR (v2.8)
+--====================================
+local RuinDoorState = {
+    enabled = false,
+    running = false,
+    thread = nil,
+    fishConnection = nil,
+    lastPromptFire = 0,
+    lastInventoryScan = 0,
+    lastTeleport = 0,
+    fishingForRarity = nil, -- Current rarity we need fish for
+    statusText = "Idle",
+    uiParagraph = nil,
+    -- Target fish for Ruin Door quest (for auto-favorite)
+    TARGET_FISH = {
+        ["Freshwater Piranha"] = true,
+        ["Goliath Tiger"] = true,
+        ["Sacred Guardian Squid"] = true,
+        ["Crocodile"] = true,
+    },
+    -- Plate configuration: rarity -> fish name
+    PLATES = {
+        Rare      = { fishName = "Freshwater Piranha" },
+        Epic      = { fishName = "Goliath Tiger" },
+        Legendary = { fishName = "Sacred Guardian Squid" },
+        Mythic    = { fishName = "Crocodile" },
+    },
+    RARITIES_ORDER = {"Rare", "Epic", "Legendary", "Mythic"},
+    SACRED_TEMPLE_CFRAME = CFrame.new(1506, -22, -641),
+    -- Cooldowns (seconds)
+    PROMPT_COOLDOWN = 1.5,
+    INVENTORY_COOLDOWN = 2,
+    TELEPORT_COOLDOWN = 5,
+    PROMPT_DISTANCE = 15, -- Max studs to fire prompt
+}
+
+-- Get the PressurePlates root folder (safe)
+local function GetRuinPlatesRoot()
+    local success, result = pcall(function()
+        local ruinInteractions = Services.Workspace:FindFirstChild("RUIN INTERACTIONS")
+        if not ruinInteractions then return nil end
+        return ruinInteractions:FindFirstChild("PressurePlates")
+    end)
+    return success and result or nil
+end
+
+-- Check if quest is active (PressurePlates folder exists = quest started)
+-- Note: Prompts may not exist yet due to streaming
+local function IsRuinQuestActive()
+    local root = GetRuinPlatesRoot()
+    return root ~= nil
+end
+
+-- Check if any prompts have streamed in (for loading state detection)
+local function HasAnyRuinPrompts()
+    local root = GetRuinPlatesRoot()
+    if not root then return false end
+    
+    local success, result = pcall(function()
+        for _, rarity in ipairs(RuinDoorState.RARITIES_ORDER) do
+            local plate = root:FindFirstChild(rarity)
+            if plate then
+                local part = plate:FindFirstChild("Part")
+                if part then
+                    local prompt = part:FindFirstChildOfClass("ProximityPrompt")
+                    if prompt then return true end
+                end
+            end
+        end
+        return false
+    end)
+    return success and result or false
+end
+
+-- Get ProximityPrompt for a specific rarity plate (safe lookup)
+local function GetRuinPrompt(rarity)
+    local root = GetRuinPlatesRoot()
+    if not root then return nil end
+    
+    local success, prompt = pcall(function()
+        local plate = root:FindFirstChild(rarity)
+        if not plate then return nil end
+        
+        local part = plate:FindFirstChild("Part")
+        if not part then return nil end
+        
+        return part:FindFirstChildOfClass("ProximityPrompt")
+    end)
+    return success and prompt or nil
+end
+
+-- Get plate Part position for distance check
+local function GetRuinPlatePosition(rarity)
+    local success, pos = pcall(function()
+        local path = Services.Workspace
+            :FindFirstChild("RUIN INTERACTIONS")
+        if not path then return nil end
+        
+        path = path:FindFirstChild("PressurePlates")
+        if not path then return nil end
+        
+        path = path:FindFirstChild(rarity)
+        if not path then return nil end
+        
+        local part = path:FindFirstChild("Part")
+        if not part then return nil end
+        
+        return part.Position
+    end)
+    return success and pos or nil
+end
+
+-- Safe inventory getter for RuinDoor (self-contained, avoids forward-ref issue)
+local function GetRuinDoorInventory()
+    if not Replion or not Replion.Client then return nil end
+    local success, result = pcall(function()
+        local data = Replion.Client:WaitReplion("Data", 2)
+        if not data then return nil end
+        local inv = data:GetExpect("Inventory")
+        return inv
+    end)
+    return success and result or nil
+end
+
+-- Check if specific fish is in inventory (unfavorited, ready to place)
+local function HasRuinFishInInventory(fishName)
+    -- Use self-contained getter (not forward-ref GetPlayerInventory)
+    local inventory = GetRuinDoorInventory()
+    if not inventory then return false, nil end
+    
+    -- Handle different inventory shapes
+    local items = inventory.Items or inventory.items or inventory
+    if type(items) ~= "table" then return false, nil end
+    
+    local success, result = pcall(function()
+        for _, item in pairs(items) do
+            if type(item) == "table" then
+                local name, _ = GetFishNameAndRarity(item)
+                if name == fishName then
+                    return true, item.UUID
+                end
+            elseif type(item) == "string" and item == fishName then
+                return true, nil
+            end
+        end
+        return false, nil
+    end)
+    
+    if success and type(result) == "boolean" then
+        return result, nil
+    elseif success and result == true then
+        return true, nil
+    end
+    return false, nil
+end
+
+-- Fire proximity prompt safely with cooldown and distance check
+local function FireRuinPromptSafe(rarity)
+    local now = tick()
+    
+    -- Cooldown check
+    if now - RuinDoorState.lastPromptFire < RuinDoorState.PROMPT_COOLDOWN then
+        return false, "cooldown"
+    end
+    
+    -- Get prompt
+    local prompt = GetRuinPrompt(rarity)
+    if not prompt then
+        return false, "no_prompt"
+    end
+    
+    -- Distance check
+    local platePos = GetRuinPlatePosition(rarity)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    
+    if not hrp or not platePos then
+        return false, "no_position"
+    end
+    
+    local distance = (hrp.Position - platePos).Magnitude
+    if distance > RuinDoorState.PROMPT_DISTANCE then
+        return false, "too_far"
+    end
+    
+    -- Fire prompt
+    local success = pcall(function()
+        fireproximityprompt(prompt)
+    end)
+    
+    if success then
+        RuinDoorState.lastPromptFire = now
+        if CONFIG.DEBUG then log("[RuinDoor] Fired prompt for " .. rarity) end
+        return true, "success"
+    end
+    
+    return false, "fire_failed"
+end
+
+-- Inline safe teleport for RuinDoor (avoids forward-ref to SafeTeleport)
+local function RuinDoorTeleport(targetPos)
+    local success = pcall(function()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        
+        -- Direct teleport with velocity reset (same logic as SafeTeleport)
+        for _ = 1, 5 do
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 2, 0))
+            task.wait(0.08)
+        end
+    end)
+    return success
+end
+
+-- Teleport to Sacred Temple for fishing
+local function TeleportToSacredTemple()
+    local now = tick()
+    
+    -- Cooldown check
+    if now - RuinDoorState.lastTeleport < RuinDoorState.TELEPORT_COOLDOWN then
+        return false
+    end
+    
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    
+    -- Only teleport if far from Sacred Temple
+    local templePos = RuinDoorState.SACRED_TEMPLE_CFRAME.Position
+    local distance = (hrp.Position - templePos).Magnitude
+    
+    if distance > 100 then
+        local success = RuinDoorTeleport(templePos)
+        if success then
+            RuinDoorState.lastTeleport = now
+            if CONFIG.DEBUG then log("[RuinDoor] Teleported to Sacred Temple") end
+            return true
+        end
+        return false
+    end
+    
+    return false -- Already at temple
+end
+
+-- Teleport close to a specific plate
+local function TeleportToPlate(rarity)
+    local platePos = GetRuinPlatePosition(rarity)
+    if not platePos then return false end
+    
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    
+    local distance = (hrp.Position - platePos).Magnitude
+    if distance > RuinDoorState.PROMPT_DISTANCE then
+        local success = RuinDoorTeleport(platePos)
+        if success and CONFIG.DEBUG then 
+            log("[RuinDoor] Teleported to " .. rarity .. " plate") 
+        end
+        return success
+    end
+    
+    return false
+end
+
+-- Check if a fish name is a Ruin Door target
+local function IsRuinTargetFish(fishName)
+    return RuinDoorState.TARGET_FISH[fishName] == true
+end
+
+-- Auto-favorite handler for Ruin Door target fish
+local function HandleRuinFishCatch()
+    if not SavedSettings.autoRuinDoorEnabled then return end
+    if not Replion or not Replion.Client then return end
+    
+    task.defer(function()
+        pcall(function()
+            local DataReplion = Replion.Client:WaitReplion("Data")
+            if not DataReplion then return end
+            
+            local inv = DataReplion:Get("Inventory")
+            if not inv or not inv.Items then return end
+            
+            -- Check recently caught items for target fish
+            for _, item in pairs(inv.Items) do
+                local uuid = item.UUID
+                if not uuid then continue end
+                
+                -- Skip if already favorited
+                if item.Favorited or item.IsFavorite then continue end
+                
+                -- Skip if already processed by AutoFavorite cache
+                if AutoFavoriteState.cache[uuid] then continue end
+                
+                local name, _ = GetFishNameAndRarity(item)
+                if IsRuinTargetFish(name) then
+                    -- Mark as processed
+                    AutoFavoriteState.cache[uuid] = true
+                    AutoFavoriteState.cacheCount = AutoFavoriteState.cacheCount + 1
+                    
+                    -- Favorite it
+                    pcall(function()
+                        if Remotes.FavoriteEvent then
+                            Remotes.FavoriteEvent:FireServer(uuid)
+                        end
+                    end)
+                    
+                    if CONFIG.DEBUG then
+                        log("[RuinDoor] Favorited target fish: " .. name)
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+-- Update UI status
+local function UpdateRuinDoorStatus(text)
+    RuinDoorState.statusText = text
+    if RuinDoorState.uiParagraph then
+        pcall(function()
+            RuinDoorState.uiParagraph:SetDesc(text)
+        end)
+    end
+end
+
+-- Get missing fish list (plates that still need fish)
+local function GetMissingRuinFish()
+    local missing = {}
+    for _, rarity in ipairs(RuinDoorState.RARITIES_ORDER) do
+        local prompt = GetRuinPrompt(rarity)
+        if prompt then -- Plate still needs fish
+            local config = RuinDoorState.PLATES[rarity]
+            if config then
+                local hasFish, _ = HasRuinFishInInventory(config.fishName)
+                table.insert(missing, {
+                    rarity = rarity,
+                    fishName = config.fishName,
+                    hasFish = hasFish,
+                })
+            end
+        end
+    end
+    return missing
+end
+
+-- Stop Auto Ruin Door (forward declaration)
+local StopAutoRuinDoor
+
+-- Main Auto Ruin Door Loop
+local function StartAutoRuinDoor()
+    if RuinDoorState.running then return end
+    RuinDoorState.running = true
+    RuinDoorState.enabled = true
+    
+    if CONFIG.DEBUG then log("[RuinDoor] Starting Auto Ruin Door") end
+    UpdateRuinDoorStatus("Starting...")
+    
+    -- Hook into fish catch event for auto-favorite
+    if Remotes.ObtainedNewFish and not RuinDoorState.fishConnection then
+        RuinDoorState.fishConnection = Remotes.ObtainedNewFish.OnClientEvent:Connect(function(...)
+            if SavedSettings.autoRuinDoorEnabled then
+                HandleRuinFishCatch()
+            end
+        end)
+    end
+    
+    -- Main loop
+    RuinDoorState.thread = task.spawn(function()
+        while RuinDoorState.running and SavedSettings.autoRuinDoorEnabled do
+            -- Check if quest is active (PressurePlates folder exists)
+            if not IsRuinQuestActive() then
+                UpdateRuinDoorStatus("Quest not active. Waiting...")
+                RuinDoorState.fishingForRarity = nil
+                task.wait(3)
+                continue
+            end
+            
+            -- Quest is active, but check if prompts have streamed in
+            if not HasAnyRuinPrompts() then
+                UpdateRuinDoorStatus("Quest active. Loading plates...")
+                task.wait(2)
+                continue
+            end
+            
+            -- Get list of missing fish/plates
+            local missing = GetMissingRuinFish()
+            
+            if #missing == 0 then
+                UpdateRuinDoorStatus("All plates filled! Quest complete.")
+                task.wait(2)
+                continue
+            end
+            
+            -- Process plates in order
+            local actionTaken = false
+            
+            for _, entry in ipairs(missing) do
+                if not RuinDoorState.running then break end
+                
+                local rarity = entry.rarity
+                local fishName = entry.fishName
+                local hasFish = entry.hasFish
+                
+                if hasFish then
+                    -- We have the fish → try to place it
+                    UpdateRuinDoorStatus("Placing " .. fishName .. " on " .. rarity .. " plate...")
+                    
+                    -- Move close to plate
+                    TeleportToPlate(rarity)
+                    task.wait(0.5)
+                    
+                    -- Fire prompt
+                    local success, reason = FireRuinPromptSafe(rarity)
+                    if success then
+                        UpdateRuinDoorStatus("Placed " .. fishName .. "!")
+                        actionTaken = true
+                        task.wait(RuinDoorState.PROMPT_COOLDOWN)
+                    else
+                        if reason == "too_far" then
+                            -- Try teleporting closer
+                            TeleportToPlate(rarity)
+                        end
+                        if CONFIG.DEBUG then 
+                            log("[RuinDoor] Failed to fire prompt: " .. tostring(reason)) 
+                        end
+                    end
+                    break -- Process one plate per loop iteration
+                else
+                    -- Don't have fish → go fishing
+                    RuinDoorState.fishingForRarity = rarity
+                    UpdateRuinDoorStatus("Need " .. fishName .. " (" .. rarity .. "). Fishing...")
+                    
+                    -- Teleport to Sacred Temple if not there
+                    TeleportToSacredTemple()
+                    
+                    -- Wait for fishing to produce the fish (event-driven via HandleRuinFishCatch)
+                    actionTaken = true
+                    break -- Wait in fishing mode
+                end
+            end
+            
+            -- Idle wait between checks
+            if actionTaken then
+                task.wait(1.5)
+            else
+                task.wait(0.5)
+            end
+        end
+        
+        UpdateRuinDoorStatus("Stopped")
+        RuinDoorState.fishingForRarity = nil
+    end)
+end
+
+StopAutoRuinDoor = function()
+    RuinDoorState.running = false
+    RuinDoorState.enabled = false
+    RuinDoorState.fishingForRarity = nil
+    
+    -- Disconnect fish catch listener
+    if RuinDoorState.fishConnection then
+        pcall(function() RuinDoorState.fishConnection:Disconnect() end)
+        RuinDoorState.fishConnection = nil
+    end
+    
+    -- Cancel thread
+    if RuinDoorState.thread then
+        pcall(function() task.cancel(RuinDoorState.thread) end)
+        RuinDoorState.thread = nil
+    end
+    
+    UpdateRuinDoorStatus("Stopped")
+    if CONFIG.DEBUG then log("[RuinDoor] Stopped Auto Ruin Door") end
+end
+
+--====================================
+-- AUTO GIFT SANTA (v2.9)
+--====================================
+local GiftSantaState = {
+    enabled = false,
+    running = false,
+    thread = nil,
+    lastRedeemAttempt = 0,
+    statusText = "Idle",
+    uiParagraph = nil,
+    debugDumped = false, -- One-time debug flag for inventory keys
+    itemsDumped = false, -- One-time debug flag for item samples
+    verifyFailDumped = false, -- One-time debug flag for verify failure
+    -- Present IDs and names (same pattern as PotionState.DATA)
+    PRESENT_DATA = {
+        ["Common Present"] = {Id = 996},
+        ["Uncommon Present"] = {Id = 997},
+        ["Rare Present"] = {Id = 998},
+        ["Epic Present"] = {Id = 999},
+    },
+    -- Reverse lookup: Id -> Name
+    PRESENT_ID_TO_NAME = {
+        [996] = "Common Present",
+        [997] = "Uncommon Present",
+        [998] = "Rare Present",
+        [999] = "Epic Present",
+    },
+    -- Legacy name set for tool fallback
+    PRESENT_NAMES = {
+        ["Common Present"] = true,
+        ["Uncommon Present"] = true,
+        ["Rare Present"] = true,
+        ["Epic Present"] = true,
+    },
+    REDEEM_COOLDOWN = 2,
+}
+
+-- Update UI status for Gift Santa
+local function UpdateGiftSantaStatus(text)
+    GiftSantaState.statusText = text
+    if GiftSantaState.uiParagraph then
+        pcall(function()
+            GiftSantaState.uiParagraph:SetDesc(text)
+        end)
+    end
+end
+
+-- Check if Christmas event is active (ToyFactory exists)
+local function IsChristmasEventActive()
+    local success, result = pcall(function()
+        return Services.Workspace:FindFirstChild("ToyFactory") ~= nil
+    end)
+    return success and result or false
+end
+
+-- Find a present in player's inventory (self-contained inventory access)
+local function FindOwnedPresent()
+    -- Get inventory directly (self-contained, avoids forward-ref to GetPlayerInventory)
+    local inventory = nil
+    if Replion and Replion.Client then
+        local success, result = pcall(function()
+            local data = Replion.Client:WaitReplion("Data", 2)
+            if data then return data:GetExpect("Inventory") end
+            return nil
+        end)
+        if success then inventory = result end
+    end
+    
+    if inventory then
+        -- One-time debug: dump inventory structure keys
+        if not GiftSantaState.debugDumped then
+            GiftSantaState.debugDumped = true
+            if CONFIG.DEBUG then
+                local keys = {}
+                for k, _ in pairs(inventory) do
+                    table.insert(keys, tostring(k))
+                end
+                log("[GiftSanta] Inventory keys: " .. table.concat(keys, ", "))
+            end
+        end
+        
+        -- Check multiple possible sub-tables where presents might be stored
+        -- Presents are Type="Gears" so check Gears, Items, and root
+        local searchTables = {
+            {name = "Gears", tbl = inventory.Gears},
+            {name = "Items", tbl = inventory.Items},
+            {name = "Tools", tbl = inventory.Tools},
+        }
+        
+        for _, search in ipairs(searchTables) do
+            if search.tbl and type(search.tbl) == "table" then
+                for _, item in pairs(search.tbl) do
+                    if type(item) == "table" and item.Id then
+                        local itemId = tonumber(item.Id)
+                        local presentName = GiftSantaState.PRESENT_ID_TO_NAME[itemId]
+                        if presentName then
+                            if CONFIG.DEBUG then
+                                log("[GiftSanta] Found present in " .. search.name .. ": " .. presentName)
+                            end
+                            return {Name = presentName, UUID = item.UUID, Id = itemId}, false
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- Debug: show sample items from first non-empty table
+        if CONFIG.DEBUG and not GiftSantaState.itemsDumped then
+            GiftSantaState.itemsDumped = true
+            for _, search in ipairs(searchTables) do
+                if search.tbl and type(search.tbl) == "table" then
+                    local samples = {}
+                    local count = 0
+                    for _, item in pairs(search.tbl) do
+                        if count >= 3 then break end
+                        if type(item) == "table" then
+                            table.insert(samples, string.format("Id=%s", tostring(item.Id)))
+                            count = count + 1
+                        end
+                    end
+                    if count > 0 then
+                        log("[GiftSanta] Sample from " .. search.name .. ": " .. table.concat(samples, ", "))
+                    end
+                end
+            end
+        end
+    end
+    
+    -- METHOD 2: Fallback - check physical Backpack/Character tools
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    
+    -- Check if already equipped (physical tool in character)
+    if char then
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") and GiftSantaState.PRESENT_NAMES[tool.Name] then
+                return {Name = tool.Name, Tool = tool}, true -- isEquipped = true
+            end
+        end
+    end
+    
+    -- Check backpack for unequipped tools
+    if backpack then
+        for _, tool in ipairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and GiftSantaState.PRESENT_NAMES[tool.Name] then
+                return {Name = tool.Name, Tool = tool}, false -- isEquipped = false
+            end
+        end
+    end
+    
+    return nil, false
+end
+
+-- Verify present is truly equipped (multi-signal: Character tools OR Replion EquippedId)
+-- Stored in GiftSantaState to avoid extra local
+GiftSantaState.IsPresentEquipped = function(presentUUID)
+    -- Signal 1: Check Character for equipped present tool
+    local char = LocalPlayer.Character
+    if char then
+        for _, child in ipairs(char:GetChildren()) do
+            if child:IsA("Tool") then
+                -- Check exact name match
+                if GiftSantaState.PRESENT_NAMES[child.Name] then
+                    return true, child.Name
+                end
+                -- Check if tool name contains "Present" (fallback for variant names)
+                if string.find(child.Name, "Present") then
+                    return true, child.Name
+                end
+            end
+        end
+    end
+    
+    -- Signal 2: Check Replion EquippedId matches our present UUID
+    if presentUUID and Replion and Replion.Client then
+        local success, equippedId = pcall(function()
+            local data = Replion.Client:WaitReplion("Data", 1)
+            if data then return data:GetExpect("EquippedId") end
+            return nil
+        end)
+        if success and equippedId and equippedId == presentUUID then
+            return true, "via_replion"
+        end
+    end
+    
+    return false, nil
+end
+
+-- Equip a present using two-step process: EquipItem + EquipToolFromHotbar
+local function EquipPresent(presentInfo)
+    if not presentInfo then return false end
+    
+    local char = LocalPlayer.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return false end
+    
+    -- If presentInfo has a physical Tool reference, use it directly
+    if presentInfo.Tool then
+        local success = pcall(function()
+            humanoid:EquipTool(presentInfo.Tool)
+        end)
+        if success and CONFIG.DEBUG then
+            log("[GiftSanta] Equipped physical tool: " .. presentInfo.Name)
+        end
+        return success
+    end
+    
+    -- For Replion items: use two-step equip (EquipItem + EquipToolFromHotbar)
+    if not presentInfo.UUID then
+        if CONFIG.DEBUG then log("[GiftSanta] No UUID for present") end
+        return false
+    end
+    
+    -- Step 1: Add item to hotbar via RE/EquipItem (category = "Gears")
+    if Remotes.RE_EquipItem then
+        pcall(function()
+            Remotes.RE_EquipItem:FireServer(presentInfo.UUID, "Gears")
+        end)
+        if CONFIG.DEBUG then log("[GiftSanta] Fired EquipItem for " .. presentInfo.Name) end
+        task.wait(0.3) -- Wait for server to update hotbar
+    end
+    
+    -- Step 2: Find slot index in EquippedItems array (inline lookup)
+    local slotIndex = nil
+    local maxRetries = 5
+    for attempt = 1, maxRetries do
+        -- Inline EquippedItems lookup
+        if Replion and Replion.Client then
+            local success, equippedItems = pcall(function()
+                local data = Replion.Client:WaitReplion("Data", 1)
+                if data then return data:GetExpect("EquippedItems") end
+                return nil
+            end)
+            if success and equippedItems and type(equippedItems) == "table" then
+                for slot, slotUUID in pairs(equippedItems) do
+                    if slotUUID == presentInfo.UUID then
+                        slotIndex = tonumber(slot)
+                        break
+                    end
+                end
+            end
+        end
+        if slotIndex then break end
+        task.wait(0.2)
+    end
+    
+    if not slotIndex then
+        -- Fallback: scan slots 2-8 looking for present
+        if CONFIG.DEBUG then log("[GiftSanta] UUID not found in EquippedItems, trying slot scan") end
+        for trySlot = 2, 8 do
+            pcall(function()
+                Remotes.RE_EquipToolFromHotbar:FireServer(trySlot)
+            end)
+            -- Retry verification with UUID for up to 0.6s
+            for verifyAttempt = 1, 3 do
+                task.wait(0.2)
+                if GiftSantaState.IsPresentEquipped(presentInfo.UUID) then
+                    if CONFIG.DEBUG then log("[GiftSanta] Found present at slot " .. trySlot) end
+                    return true
+                end
+            end
+        end
+        if CONFIG.DEBUG then log("[GiftSanta] Could not find slot for present") end
+        return false
+    end
+    
+    -- Step 3: Equip from hotbar using discovered slot
+    if Remotes.RE_EquipToolFromHotbar then
+        pcall(function()
+            Remotes.RE_EquipToolFromHotbar:FireServer(slotIndex)
+        end)
+        if CONFIG.DEBUG then log("[GiftSanta] Fired EquipToolFromHotbar slot " .. slotIndex) end
+    end
+    
+    -- Verify equipped with retry (up to 1.5s for replication delay)
+    for verifyAttempt = 1, 6 do
+        task.wait(0.25)
+        if GiftSantaState.IsPresentEquipped(presentInfo.UUID) then
+            if CONFIG.DEBUG then log("[GiftSanta] Present verified equipped: " .. presentInfo.Name) end
+            return true
+        end
+    end
+    
+    -- Debug dump on failure (one-time)
+    if not GiftSantaState.verifyFailDumped and CONFIG.DEBUG then
+        GiftSantaState.verifyFailDumped = true
+        local char = LocalPlayer.Character
+        local tools = {}
+        if char then
+            for _, child in ipairs(char:GetChildren()) do
+                if child:IsA("Tool") then
+                    table.insert(tools, child.Name)
+                end
+            end
+        end
+        log("[GiftSanta] Verify failed. Character tools: " .. table.concat(tools, ", "))
+        log("[GiftSanta] Expected UUID: " .. tostring(presentInfo.UUID))
+    end
+    
+    if CONFIG.DEBUG then log("[GiftSanta] Equip verification failed after retries") end
+    return false
+end
+
+-- Try direct redeem (RedeemGift:InvokeServer with no args)
+local function TryRedeemGift()
+    -- Use cached remote from Remotes table
+    if not Remotes.RF_RedeemGift then
+        if CONFIG.DEBUG then log("[GiftSanta] RedeemGift remote not found") end
+        return false, "no_remote"
+    end
+    
+    -- Invoke with no args (per christmashgift.lua)
+    local invokeSuccess, redeemResult = pcall(function()
+        return Remotes.RF_RedeemGift:InvokeServer()
+    end)
+    
+    if not invokeSuccess then
+        if CONFIG.DEBUG then log("[GiftSanta] InvokeServer failed") end
+        return false, "invoke_error"
+    end
+    
+    if redeemResult then
+        if CONFIG.DEBUG then log("[GiftSanta] Redeem successful!") end
+        return true, "success"
+    end
+    
+    return false, "redeem_failed"
+end
+
+-- Fallback: Fire DialogueEnded then retry redeem
+local function TryFallbackDialogue()
+    if not Remotes.RE_DialogueEnded then return false end
+    
+    local success = pcall(function()
+        Remotes.RE_DialogueEnded:FireServer("Santa", 1, 2)
+    end)
+    
+    if success and CONFIG.DEBUG then
+        log("[GiftSanta] DialogueEnded fired")
+    end
+    
+    return success
+end
+
+-- Forward declaration
+local StopAutoGiftSanta
+
+-- Main Auto Gift Santa loop
+local function StartAutoGiftSanta()
+    if GiftSantaState.running then return end
+    GiftSantaState.running = true
+    GiftSantaState.enabled = true
+    
+    if CONFIG.DEBUG then log("[GiftSanta] Starting Auto Gift Santa") end
+    UpdateGiftSantaStatus("Starting...")
+    
+    GiftSantaState.thread = task.spawn(function()
+        while GiftSantaState.running and SavedSettings.autoGiftSantaEnabled do
+            -- Check if event is active
+            if not IsChristmasEventActive() then
+                UpdateGiftSantaStatus("Event not active (no ToyFactory)")
+                task.wait(5)
+                continue
+            end
+            
+            -- Find a present
+            local present, isEquipped = FindOwnedPresent()
+            
+            if not present then
+                UpdateGiftSantaStatus("No presents in inventory. Waiting...")
+                task.wait(3)
+                continue
+            end
+            
+            -- Equip if not already verified (pass UUID for multi-signal check)
+            if not GiftSantaState.IsPresentEquipped(present.UUID) then
+                UpdateGiftSantaStatus("Equipping " .. present.Name .. "...")
+                local equipSuccess = EquipPresent(present)
+                if not equipSuccess then
+                    UpdateGiftSantaStatus("Failed to equip. Retrying...")
+                    task.wait(2)
+                    continue
+                end
+                -- EquipPresent already does retry verification, so just double-check
+                if not GiftSantaState.IsPresentEquipped(present.UUID) then
+                    UpdateGiftSantaStatus("Equip not verified. Retrying...")
+                    task.wait(1)
+                    continue
+                end
+            end
+            
+            -- Cooldown check
+            local now = tick()
+            if now - GiftSantaState.lastRedeemAttempt < GiftSantaState.REDEEM_COOLDOWN then
+                task.wait(GiftSantaState.REDEEM_COOLDOWN - (now - GiftSantaState.lastRedeemAttempt))
+            end
+            
+            -- Try direct redeem
+            UpdateGiftSantaStatus("Redeeming " .. present.Name .. "...")
+            GiftSantaState.lastRedeemAttempt = tick()
+            
+            local success, reason = TryRedeemGift()
+            
+            if success then
+                UpdateGiftSantaStatus("Redeemed " .. present.Name .. "!")
+                task.wait(1.5)
+                continue
+            end
+            
+            -- Direct redeem failed - try fallback
+            if reason == "redeem_failed" then
+                UpdateGiftSantaStatus("Direct redeem failed. Trying dialogue...")
+                TryFallbackDialogue()
+                task.wait(0.5)
+                
+                -- Retry redeem once
+                local retrySuccess, _ = TryRedeemGift()
+                if retrySuccess then
+                    UpdateGiftSantaStatus("Redeemed via fallback!")
+                else
+                    UpdateGiftSantaStatus("Fallback failed. Will retry...")
+                end
+            else
+                UpdateGiftSantaStatus("Error: " .. tostring(reason))
+            end
+            
+            task.wait(2)
+        end
+        
+        UpdateGiftSantaStatus("Stopped")
+    end)
+end
+
+StopAutoGiftSanta = function()
+    GiftSantaState.running = false
+    GiftSantaState.enabled = false
+    
+    if GiftSantaState.thread then
+        pcall(function() task.cancel(GiftSantaState.thread) end)
+        GiftSantaState.thread = nil
+    end
+    
+    UpdateGiftSantaStatus("Stopped")
+    if CONFIG.DEBUG then log("[GiftSanta] Stopped Auto Gift Santa") end
+end
 
 -- Time Helpers (UTC safe)
 local function NowUTC()
@@ -2268,6 +3160,8 @@ local TotemState = {
         ["Shiny Totem"] = {Id = 3, Duration = 3601},
     },
     NAMES = {"Luck Totem", "Mutation Totem", "Shiny Totem"},
+    -- Safety State (merged to save locals)
+    Safety = { enabled = false, safetyConnection = nil, originalCollisions = {} },
 }
 
 -- Generate offsets dynamically based on spacing (stored in TotemState)
@@ -2295,13 +3189,6 @@ TotemState.offsets = (function()
         Vector3.new(halfS, -S, -halfR) + offset,
     }
 end)()
-
--- Totem Safety State (for noclip/float/anti-fall during ritual)
-local TotemSafetyState = {
-    enabled = false,
-    safetyConnection = nil, -- Single merged connection (noclip + state forcing)
-    originalCollisions = {},
-}
 
 -- =================================================================
 -- AUTO CONSUME POTION SYSTEM (v2.4)
@@ -2498,8 +3385,8 @@ end
 
 -- Enable fly physics for totem placement
 EnableTotemSafety = function()
-    if TotemSafetyState.enabled then return end
-    TotemSafetyState.enabled = true
+    if TotemState.Safety.enabled then return end
+    TotemState.Safety.enabled = true
     
     local char = LocalPlayer.Character
     if not char then return end
@@ -2556,11 +3443,11 @@ EnableTotemSafety = function()
     bv.Parent = mainPart
     
     -- 7. NOCLIP LOOP (Swimming state for aerial stability)
-    if TotemSafetyState.safetyConnection then
-        TotemSafetyState.safetyConnection:Disconnect()
+    if TotemState.Safety.safetyConnection then
+        TotemState.Safety.safetyConnection:Disconnect()
     end
-    TotemSafetyState.safetyConnection = RunService.Heartbeat:Connect(function()
-        if not TotemSafetyState.enabled then return end
+    TotemState.Safety.safetyConnection = RunService.Heartbeat:Connect(function()
+        if not TotemState.Safety.enabled then return end
         
         local c = LocalPlayer.Character
         local h = c and c:FindFirstChild("Humanoid")
@@ -2597,13 +3484,13 @@ end
 
 -- Disable safety features and restore normal state (v2.7.3: Respawn method - cleanest solution)
 DisableTotemSafety = function()
-    if not TotemSafetyState.enabled then return end
-    TotemSafetyState.enabled = false
+    if not TotemState.Safety.enabled then return end
+    TotemState.Safety.enabled = false
     
     -- 1. DISCONNECT LOOPS FIRST
-    if TotemSafetyState.safetyConnection then
-        TotemSafetyState.safetyConnection:Disconnect()
-        TotemSafetyState.safetyConnection = nil
+    if TotemState.Safety.safetyConnection then
+        TotemState.Safety.safetyConnection:Disconnect()
+        TotemState.Safety.safetyConnection = nil
     end
     
     -- 2. DISCONNECT DEATH HANDLER
@@ -5086,7 +5973,7 @@ TeleportTab:Dropdown({
     end)(),
     Value = CONFIG.selectedTeleport,
     Callback = function(option)
-        selectedTeleport = option
+        CONFIG.selectedTeleport = option
     end
 })
 
@@ -5096,6 +5983,12 @@ TeleportTab:Button({
         local targetCFrame = CONFIG.TELEPORT_LOCATIONS[CONFIG.selectedTeleport]
         if targetCFrame and LocalPlayer.Character and LocalPlayer.Character.PrimaryPart then
             LocalPlayer.Character:SetPrimaryPartCFrame(targetCFrame)
+        elseif not targetCFrame then
+            WindUI:Notify({
+                Title = "Teleport",
+                Content = "Invalid location: " .. tostring(CONFIG.selectedTeleport),
+                Duration = 3
+            })
         end
     end
 })
@@ -5386,6 +6279,121 @@ EventsTab:Button({
     Desc = "Manual teleport",
     Callback = function()
         SafeTeleport(EventState.COORDS.Lochness)
+    end
+})
+
+-- Ruin Door Quest Section
+EventsTab:Divider()
+EventsTab:Section({Title = "Ruin Door Quest (v2.8)", TextSize = 16})
+
+RuinDoorState.uiParagraph = EventsTab:Paragraph({
+    Title = "Ruin Door Status",
+    Content = "Status: " .. RuinDoorState.statusText,
+})
+
+EventsTab:Toggle({
+    Title = "Auto Ruin Door",
+    Desc = "Auto-place fish on pressure plates. Fishes at Sacred Temple if missing fish.",
+    Value = SavedSettings.autoRuinDoorEnabled or false,
+    Callback = function(state)
+        SavedSettings.autoRuinDoorEnabled = state
+        SaveSettings()
+        if state then
+            StartAutoRuinDoor()
+        else
+            StopAutoRuinDoor()
+        end
+    end
+})
+
+EventsTab:Button({
+    Title = "Check Quest Status",
+    Desc = "Show current Ruin Door quest progress",
+    Callback = function()
+        local isActive = IsRuinQuestActive()
+        if not isActive then
+            WindUI:Notify({
+                Title = "Ruin Door",
+                Content = "Quest not active (no pressure plates found)",
+                Duration = 3
+            })
+            return
+        end
+        
+        local missing = GetMissingRuinFish()
+        local statusParts = {}
+        for _, entry in ipairs(missing) do
+            local icon = entry.hasFish and "✓" or "✗"
+            table.insert(statusParts, entry.rarity .. ": " .. icon .. " " .. entry.fishName)
+        end
+        
+        if #missing == 0 then
+            WindUI:Notify({
+                Title = "Ruin Door",
+                Content = "All plates filled!",
+                Duration = 3
+            })
+        else
+            WindUI:Notify({
+                Title = "Ruin Door - " .. #missing .. " plates remaining",
+                Content = table.concat(statusParts, "\n"),
+                Duration = 5
+            })
+        end
+    end
+})
+
+EventsTab:Button({
+    Title = "Teleport to Sacred Temple",
+    Desc = "Manual teleport to fishing spot",
+    Callback = function()
+        SafeTeleport(RuinDoorState.SACRED_TEMPLE_CFRAME.Position)
+    end
+})
+
+-- Auto Gift Santa Section (v2.9)
+EventsTab:Divider()
+EventsTab:Section({Title = "Auto Gift Santa (v2.9)", TextSize = 16})
+
+GiftSantaState.uiParagraph = EventsTab:Paragraph({
+    Title = "Gift Santa Status",
+    Content = "Status: " .. GiftSantaState.statusText,
+})
+
+EventsTab:Toggle({
+    Title = "Auto Gift Santa",
+    Desc = "Automatically equip presents and give to Santa at Toy Factory",
+    Value = SavedSettings.autoGiftSantaEnabled or false,
+    Callback = function(state)
+        SavedSettings.autoGiftSantaEnabled = state
+        SaveSettings()
+        if state then
+            StartAutoGiftSanta()
+        else
+            StopAutoGiftSanta()
+        end
+    end
+})
+
+EventsTab:Button({
+    Title = "Check Present Inventory",
+    Desc = "Show presents you currently own",
+    Callback = function()
+        local present, isEquipped = FindOwnedPresent()
+        if present then
+            local status = isEquipped and "(Equipped)" or "(In Backpack)"
+            WindUI:Notify({
+                Title = "Present Found",
+                Content = present.Name .. " " .. status,
+                Duration = 3
+            })
+        else
+            WindUI:Notify({
+                Title = "No Presents",
+                Content = "No presents found in inventory",
+                Duration = 3
+            })
+        end
     end
 })
 
@@ -5736,7 +6744,7 @@ InventoryTab:Dropdown({
     Title = "Filter by Mutation",
     Desc = "Favorite items with these mutations (OR logic)",
     SearchBarEnabled = true,
-    Values = MUTATION_OPTIONS,
+    Values = AutoFavoriteState.MUTATION_OPTIONS,
     Value = SavedSettings.autoFavoriteMutations or {},
     Multi = true,
     AllowNone = true,
@@ -6343,6 +7351,15 @@ if SavedSettings.autoPotionEnabled then
         PotionState.active = true
         RunAutoPotionLoop()
         if CONFIG.DEBUG then log("[AutoPotion] Resumed from saved settings") end
+    end)
+end
+
+-- Start Auto Ruin Door if enabled on load (v2.8)
+if SavedSettings.autoRuinDoorEnabled then
+    task.spawn(function()
+        task.wait(3)
+        StartAutoRuinDoor()
+        if CONFIG.DEBUG then log("[RuinDoor] Resumed from saved settings") end
     end)
 end
 
