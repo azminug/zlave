@@ -1761,17 +1761,13 @@ local EventState = {
         TELEPORT_COOLDOWN = 3,    -- seconds
         MOVE_THRESHOLD = 5,       -- studs
         PLATFORM_OFFSET_Y = 4,    -- studs below teleport destination
-        TELEPORT_OFFSET_Y = 10,   -- studs above event for teleport
+        TELEPORT_OFFSET_Y = -50,  -- v3.1.0: (legacy, superseded by SEA_LEVEL_Y)
+        SEA_LEVEL_Y = 20,         -- v3.1.1: Fixed landing altitude (sea level)
         -- v3.0.1: Streaming-safe caching
         cachedCFrame = nil,       -- last known event CFrame (persists during stream-out)
         cachedCountdown = nil,    -- last known countdown text
         lastSeenAt = 0,           -- tick() when event was last visible
         MISSING_GRACE_SECONDS = 30, -- how long to use cache before "not found"
-        -- v3.0.2: Fisherman Island staging
-        FISHERMAN_CFRAME = CFrame.new(34, 26, 2776),
-        stagingPhase = false,     -- true when staging at Fisherman Island
-        lastStagingAt = 0,        -- tick() of last staging teleport
-        STAGING_COOLDOWN = 10,    -- seconds between staging attempts
         platformLockedY = nil,    -- locked Y position for stable platform
         -- v3.0.4: Rotation staging support
         rotationStagingAt = 0,    -- tick() of rotation-triggered staging
@@ -1895,15 +1891,20 @@ EventState.NewYearsWhale.GetEventInstance = function()
     return locations:FindFirstChild("2026 Event")
 end
 
--- Get event CFrame (handles both Part and Model)
+-- Get event CFrame from Black Hole (v3.1.0)
 EventState.NewYearsWhale.GetEventCFrame = function()
-    local event = EventState.NewYearsWhale.GetEventInstance()
-    if not event then return nil end
-    if event:IsA("BasePart") then return event.CFrame end
-    if event:IsA("Model") then return event:GetPivot() end
-    -- Fallback: try PrimaryPart
-    if event:IsA("Model") and event.PrimaryPart then
-        return event.PrimaryPart.CFrame
+    -- v3.1.0: Use workspace.Props["Black Hole"] directly
+    local props = Services.Workspace:FindFirstChild("Props")
+    if not props then return nil end
+    local blackHole = props:FindFirstChild("Black Hole")
+    if not blackHole then return nil end
+    
+    if blackHole:IsA("BasePart") then return blackHole.CFrame end
+    if blackHole:IsA("Model") then 
+        if blackHole.PrimaryPart then
+            return blackHole.PrimaryPart.CFrame
+        end
+        return blackHole:GetPivot() 
     end
     return nil
 end
@@ -2057,40 +2058,19 @@ EventState.NewYearsWhale.Start = function()
         local effectiveCountdown = countdown or state.cachedCountdown or "???"
         local isUsingCache = (not eventCF) and state.cachedCFrame
         
-        -- v3.0.2: Fisherman Island staging when event not visible and no cache
+        -- v3.1.0: No staging needed - Black Hole should always be visible
         if not effectiveCF then
-            -- Event never seen - need to stage at Fisherman Island to trigger replication
-            local stagingCooldownOK = (now - state.lastStagingAt) > state.STAGING_COOLDOWN
-            
-            if stagingCooldownOK and not state.stagingPhase then
-                state.stagingPhase = true
-                state.lastStagingAt = now
-                state.UpdateStatus("🚢 Staging at Fisherman Island...")
-                
-                -- Teleport to Fisherman Island
-                local stagingPos = state.FISHERMAN_CFRAME.Position
-                hrp.CFrame = CFrame.new(stagingPos.X, stagingPos.Y + 5, stagingPos.Z)
-                
-                -- Set platform at staging location
-                state.SetPlatformPosition(stagingPos.X, stagingPos.Y + 5, stagingPos.Z)
-                return
-            elseif state.stagingPhase then
-                state.UpdateStatus("🚢 Waiting for event to load...")
-                return
-            else
-                state.UpdateStatus("Event not found. Staging in " .. 
-                    math.ceil(state.STAGING_COOLDOWN - (now - state.lastStagingAt)) .. "s")
-                return
-            end
+            state.UpdateStatus("⚠️ Black Hole not found in workspace.Props")
+            return
         end
         
         -- Event found or cached - check grace period for cache
         if isUsingCache then
             local elapsed = now - state.lastSeenAt
             if elapsed > state.MISSING_GRACE_SECONDS then
-                -- Cache expired - need re-staging
+                -- Cache expired - wait for Black Hole to be visible
                 state.cachedCFrame = nil
-                state.UpdateStatus("Event lost. Re-staging...")
+                state.UpdateStatus("⚠️ Black Hole not visible, waiting...")
                 return
             end
         end
@@ -2115,8 +2095,8 @@ EventState.NewYearsWhale.Start = function()
         local cooldownOK = (now - state.lastTeleportAt) > state.TELEPORT_COOLDOWN
         
         if needTeleport and cooldownOK then
-            -- Teleport above event with vertical offset
-            local targetY = eventPos.Y + state.TELEPORT_OFFSET_Y
+            -- v3.1.1: Teleport to fixed sea-level Y (not offset from Black Hole)
+            local targetY = state.SEA_LEVEL_Y or 20
             local targetCF = CFrame.new(eventPos.X, targetY, eventPos.Z)
             hrp.CFrame = targetCF
             
@@ -5054,81 +5034,59 @@ local RotationState = {
 -- v3.0.9: New Years 2026 guard - MUST be defined after RotationState exists
 -- (Defining inside the table literal causes nil reference because RotationState
 -- doesn't exist yet during table construction)
+-- v3.1.0: Synchronized time for rotation countdown (shared across instances)
+RotationState.GetSyncedTime = function()
+    local ok, serverTime = pcall(function() return workspace:GetServerTimeNow() end)
+    return ok and serverTime or os.time()
+end
+
 RotationState.GUARDS["New Years 2026"] = function()
-    -- VERSION MARKER: v3.0.9
+    -- VERSION MARKER: v3.1.2
     if CONFIG.DEBUG then
-        print("[Guard] New Years 2026 v3.0.9 invoked")
+        print("[Guard] New Years 2026 v3.1.2 invoked")
     end
     
     local state = EventState.NewYearsWhale
     if not state then return false end
     
-    local now = tick()
+    -- v3.1.1: Use fixed sea-level Y instead of offset from Black Hole
+    local seaLevelY = state.SEA_LEVEL_Y or 20
     
-    -- Priority 1: Cache is ready - use it (ACCESSIBLE)
+    -- Try to get Black Hole CFrame
+    local eventCF = nil
+    if state.GetEventCFrame then
+        pcall(function() eventCF = state.GetEventCFrame() end)
+    end
+    
+    if eventCF and typeof(eventCF) == "CFrame" then
+        local pos = eventCF.Position
+        if pos then
+            -- v3.1.1: Use fixed sea-level Y (not offset from Black Hole)
+            RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, seaLevelY, pos.Z)
+            state.cachedCFrame = eventCF
+            state.lastSeenAt = tick()
+            return true  -- Accessible
+        end
+    end
+    
+    -- Check cache as fallback
     if state.cachedCFrame and state.lastSeenAt then
-        local age = now - state.lastSeenAt
+        local age = tick() - state.lastSeenAt
         local graceSeconds = state.MISSING_GRACE_SECONDS or 30
         if age < graceSeconds then
             local pos = state.cachedCFrame.Position
             if pos then
-                RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, pos.Y + 10, pos.Z)
-                return true
+                RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, seaLevelY, pos.Z)
+                return true  -- Accessible from cache
             end
         end
     end
     
-    -- Priority 2: Try to get live event CFrame directly (ACCESSIBLE)
-    if state.GetEventCFrame then
-        local eventCF = nil
-        pcall(function() eventCF = state.GetEventCFrame() end)
-        if eventCF and typeof(eventCF) == "CFrame" then
-            local pos = eventCF.Position
-            if pos then
-                RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, pos.Y + 10, pos.Z)
-                state.cachedCFrame = eventCF
-                state.lastSeenAt = now
-                return true
-            end
-        end
+    -- Black Hole not found - skip this location
+    if CONFIG.DEBUG then
+        print("[Guard] New Years 2026: Black Hole not found, skipping")
     end
-    
-    -- Event not visible - start assist mode to trigger staging
-    if not state.enabled and state.StartAssist then
-        pcall(function()
-            state.StartAssist()
-            if CONFIG.DEBUG then
-                print("[Rotation] New Years 2026: Started assist mode for staging")
-            end
-        end)
-    end
-    
-    -- Check if assist is timing out (INACCESSIBLE after timeout)
-    if state.assistMode and state.assistStartedAt and state.assistStartedAt > 0 then
-        local assistAge = now - state.assistStartedAt
-        local timeout = state.ASSIST_TIMEOUT or 60
-        if assistAge > timeout then
-            if state.StopAssist then
-                pcall(state.StopAssist)
-            end
-            if CONFIG.DEBUG then
-                print("[Rotation] New Years 2026: Assist timed out, skipping")
-            end
-            return false  -- Timed out, allow skip
-        end
-    end
-    
-    -- Set staging destination for rotation to use
-    local fishermanCF = state.FISHERMAN_CFRAME
-    if fishermanCF and typeof(fishermanCF) == "CFrame" then
-        local fishermanPos = fishermanCF.Position
-        if fishermanPos then
-            RotationState.LOCATIONS["New Years 2026"] = Vector3.new(fishermanPos.X, fishermanPos.Y + 5, fishermanPos.Z)
-        end
-    end
-    
-    -- Return PENDING - don't skip, rotation should wait
-    return "PENDING"
+    return false
 end
 
 -- v3.0.8: Unified guard invocation helper (avoids duplicated logic)
@@ -5542,6 +5500,33 @@ local function ExecuteSmartSequence(targetPos, locationName, onComplete)
                 print("[SmartSeq] STEP 1 Complete: Teleported to " .. locationName)
             end
             
+            -- v3.1.2: Create platform for New Years 2026 (reuse event platform logic)
+            if locationName == "New Years 2026" then
+                local state = EventState.NewYearsWhale
+                if state then
+                    -- Robust platform creation with retry
+                    local platformCreated = false
+                    for attempt = 1, 3 do
+                        if state.CreatePlatform then
+                            state.CreatePlatform()
+                        end
+                        if state.SetPlatformPosition then
+                            state.SetPlatformPosition(targetPos.X, targetPos.Y, targetPos.Z)
+                        end
+                        -- Verify platform exists
+                        if state.platform and state.platform.Parent then
+                            platformCreated = true
+                            break
+                        end
+                        task.wait(0.1)
+                    end
+                    -- Always print confirmation (for debugging production issues)
+                    print(string.format("[Rotation] New Years 2026 platform: %s at Y=%.1f", 
+                        platformCreated and "CREATED" or "FAILED",
+                        state.platformLockedY or 0))
+                end
+            end
+            
             -- STEP 2: Wait for physics to settle
             task.wait(1.0) -- Increased from 0.5s for better physics settle
             
@@ -5630,13 +5615,13 @@ local function StartRotationManager()
     
     RotationState.isActive = true
     RotationState.isPaused = false
-    RotationState.lastRotationTime = os.time()
+    RotationState.lastRotationTime = RotationState.GetSyncedTime()
     
     RotationState.thread = task.spawn(function()
         while RotationState.isActive and SavedSettings.rotationEnabled do
             local enabled = GetEnabledRotationLocations()
             local intervalSeconds = (SavedSettings.rotationIntervalMinutes or 60) * 60
-            local timeSinceRotation = os.time() - RotationState.lastRotationTime
+            local timeSinceRotation = RotationState.GetSyncedTime() - RotationState.lastRotationTime
             local timeUntilRotation = intervalSeconds - timeSinceRotation
             
             -- Scan for totems
@@ -5702,7 +5687,7 @@ local function StartRotationManager()
                         
                         ExecuteSmartSequence(targetPos, locationName, function(success)
                             if success then
-                                RotationState.lastRotationTime = os.time()
+                                RotationState.lastRotationTime = RotationState.GetSyncedTime()
                             end
                         end)
                     end
