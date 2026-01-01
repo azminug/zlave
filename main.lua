@@ -195,6 +195,8 @@ local SavedSettings = {
     autoRuinDoorEnabled = false,
     -- v2.9: Auto Gift Santa
     autoGiftSantaEnabled = false,
+    -- v3.0: Auto New Years Whale
+    autoNewYearsWhaleEnabled = false,
 }
 
 local function LoadSettings()
@@ -1741,14 +1743,491 @@ local EventState = {
         [14]=true, [16]=true, [18]=true,
         [20]=true, [22]=true,
     },
-    CHRISTMAS_DURATION = 29 * 60, -- 29 minutes
+    CHRISTMAS_DURATION = 30 * 60, -- 30 minutes
     RUIN_DOOR = nil,
+    -- v2.9: Object-based cave detection
+    caveActiveSince = nil,       -- tick() when cave became active
+    caveLastState = "unknown",   -- "active"|"closed"|"loading"
+    caveDebugDumped = false,     -- one-time debug dump
+    -- v3.0: New Years Whale (nested to save registers)
+    NewYearsWhale = {
+        enabled = false,
+        platform = nil,
+        lastTeleportAt = 0,
+        lastEventCF = nil,
+        statusText = "Idle",
+        connection = nil,
+        uiParagraph = nil,
+        TELEPORT_COOLDOWN = 3,    -- seconds
+        MOVE_THRESHOLD = 5,       -- studs
+        PLATFORM_OFFSET_Y = 4,    -- studs below teleport destination
+        TELEPORT_OFFSET_Y = 10,   -- studs above event for teleport
+        -- v3.0.1: Streaming-safe caching
+        cachedCFrame = nil,       -- last known event CFrame (persists during stream-out)
+        cachedCountdown = nil,    -- last known countdown text
+        lastSeenAt = 0,           -- tick() when event was last visible
+        MISSING_GRACE_SECONDS = 30, -- how long to use cache before "not found"
+        -- v3.0.2: Fisherman Island staging
+        FISHERMAN_CFRAME = CFrame.new(34, 26, 2776),
+        stagingPhase = false,     -- true when staging at Fisherman Island
+        lastStagingAt = 0,        -- tick() of last staging teleport
+        STAGING_COOLDOWN = 10,    -- seconds between staging attempts
+        platformLockedY = nil,    -- locked Y position for stable platform
+        -- v3.0.4: Rotation staging support
+        rotationStagingAt = 0,    -- tick() of rotation-triggered staging
+        rotationAttempts = 0,     -- consecutive staging attempts by rotation
+        MAX_ROTATION_ATTEMPTS = 3, -- max attempts before allowing rotation skip
+        ROTATION_STAGING_GRACE = 15, -- seconds to wait for event after staging
+        -- v3.0.5: Rotation assist mode (delegation)
+        assistMode = false,       -- true when rotation started the monitor
+        assistStartedAt = 0,      -- tick() when assist was started
+        ASSIST_TIMEOUT = 60,      -- seconds before assist gives up
+    },
 }
 
 -- Try to find ancient ruin door
 pcall(function()
     EventState.RUIN_DOOR = Services.Workspace:FindFirstChild("RUIN INTERACTIONS") and Services.Workspace["RUIN INTERACTIONS"]:FindFirstChild("Door")
 end)
+
+--====================================
+-- CHRISTMAS CAVE OBJECT-BASED DETECTION (v2.9)
+-- Stored as methods on EventState to save registers
+--====================================
+-- Safe finder: returns nil if any part of chain missing
+EventState.FindCavernTeleporter = function()
+    local map = Services.Workspace:FindFirstChild("Map")
+    if not map then return nil end
+    local cavern = map:FindFirstChild("CavernTeleporter")
+    if not cavern then return nil end
+    return cavern:FindFirstChild("StartTeleport")
+end
+
+-- Check if ProximityPrompt exists (event running indicator)
+EventState.HasChristmasCavePrompt = function()
+    local startTeleport = EventState.FindCavernTeleporter()
+    if not startTeleport then return false end
+    local teleportPrompt = startTeleport:FindFirstChild("TELEPORT_PROMPT")
+    if not teleportPrompt then return false end
+    return teleportPrompt:FindFirstChild("ProximityPrompt") ~= nil
+end
+
+-- Get label text from cave teleporter GUI
+EventState.GetChristmasCaveLabelText = function()
+    local startTeleport = EventState.FindCavernTeleporter()
+    if not startTeleport then return nil end
+    local gui = startTeleport:FindFirstChild("Gui")
+    if not gui then return nil end
+    local frame = gui:FindFirstChild("Frame")
+    if not frame then return nil end
+    local label = frame:FindFirstChild("NewLabel")
+    if not label then return nil end
+    return label.Text
+end
+
+-- Main detector: returns {isActive, state, timeLeftSeconds}
+-- state: "active" | "closed" | "loading"
+EventState.GetChristmasCaveStatus = function()
+    local labelText = EventState.GetChristmasCaveLabelText()
+    local hasPrompt = EventState.HasChristmasCavePrompt()
+    
+    -- Priority 1: Label explicitly says CLOSED
+    if labelText and string.find(labelText, "CAVE CLOSED") then
+        return {
+            isActive = false,
+            state = "closed",
+            timeLeftSeconds = nil
+        }
+    end
+    
+    -- Priority 2: Label says Christmas Cave
+    if labelText and string.find(labelText, "Christmas Cave") then
+        local timeLeft = nil
+        if EventState.caveActiveSince then
+            local elapsed = tick() - EventState.caveActiveSince
+            timeLeft = math.max(0, 1800 - elapsed) -- 30 min = 1800s
+        end
+        return {
+            isActive = true,
+            state = "active",
+            timeLeftSeconds = timeLeft
+        }
+    end
+    
+    -- Priority 3: Prompt exists (fallback indicator)
+    if hasPrompt then
+        local timeLeft = nil
+        if EventState.caveActiveSince then
+            local elapsed = tick() - EventState.caveActiveSince
+            timeLeft = math.max(0, 1800 - elapsed)
+        end
+        return {
+            isActive = true,
+            state = "active",
+            timeLeftSeconds = timeLeft
+        }
+    end
+    
+    -- Priority 4: Objects not loaded / unknown
+    if not labelText and not EventState.FindCavernTeleporter() then
+        return {
+            isActive = false,
+            state = "loading",
+            timeLeftSeconds = nil
+        }
+    end
+    
+    -- Default: closed
+    return {
+        isActive = false,
+        state = "closed",
+        timeLeftSeconds = nil
+    }
+end
+
+--====================================
+-- NEW YEARS WHALE METHODS (v3.0) - stored on EventState to save registers
+--====================================
+-- Get the 2026 Event instance safely
+EventState.NewYearsWhale.GetEventInstance = function()
+    local locations = Services.Workspace:FindFirstChild("Locations")
+    if not locations then return nil end
+    return locations:FindFirstChild("2026 Event")
+end
+
+-- Get event CFrame (handles both Part and Model)
+EventState.NewYearsWhale.GetEventCFrame = function()
+    local event = EventState.NewYearsWhale.GetEventInstance()
+    if not event then return nil end
+    if event:IsA("BasePart") then return event.CFrame end
+    if event:IsA("Model") then return event:GetPivot() end
+    -- Fallback: try PrimaryPart
+    if event:IsA("Model") and event.PrimaryPart then
+        return event.PrimaryPart.CFrame
+    end
+    return nil
+end
+
+-- Get countdown text from event GUI
+EventState.NewYearsWhale.GetCountdown = function()
+    local event = EventState.NewYearsWhale.GetEventInstance()
+    if not event then return nil end
+    local tag = event:FindFirstChild("Tag")
+    if not tag then return nil end
+    local frame = tag:FindFirstChild("Frame")
+    if not frame then return nil end
+    local countdown = frame:FindFirstChild("Countdown")
+    if not countdown then return nil end
+    local label1 = countdown:FindFirstChild("Label")
+    if not label1 then return nil end
+    local label2 = label1:FindFirstChild("Label")
+    if not label2 then return nil end
+    return label2.Text
+end
+
+-- Create anchored invisible platform (idempotent)
+EventState.NewYearsWhale.CreatePlatform = function()
+    -- Check if platform exists AND is still parented (not destroyed)
+    local existing = EventState.NewYearsWhale.platform
+    if existing and existing.Parent then return existing end
+    
+    -- Clean up reference if platform was destroyed externally
+    if existing and not existing.Parent then
+        EventState.NewYearsWhale.platform = nil
+    end
+    
+    local platform = Instance.new("Part")
+    platform.Name = "NewYearsWhalePlatform"
+    platform.Anchored = true
+    platform.CanCollide = true
+    platform.Size = Vector3.new(16, 2, 16)
+    platform.Material = Enum.Material.SmoothPlastic
+    platform.Transparency = 1  -- Invisible
+    platform.CastShadow = false
+    platform.CanQuery = false  -- Don't interfere with raycasts
+    platform.Parent = Services.Workspace
+    EventState.NewYearsWhale.platform = platform
+    return platform
+end
+
+-- Position platform at specific world coordinates (called on teleport, not every tick)
+EventState.NewYearsWhale.SetPlatformPosition = function(worldX, worldY, worldZ)
+    EventState.NewYearsWhale.CreatePlatform()
+    local plat = EventState.NewYearsWhale.platform
+    if not plat or not plat.Parent then return end
+    
+    -- Lock the Y position and set platform there
+    local platformY = worldY - EventState.NewYearsWhale.PLATFORM_OFFSET_Y
+    EventState.NewYearsWhale.platformLockedY = platformY
+    plat.CFrame = CFrame.new(worldX, platformY, worldZ)
+end
+
+-- Update platform XZ only (keeps locked Y, prevents drift)
+EventState.NewYearsWhale.UpdatePlatformXZ = function()
+    local plat = EventState.NewYearsWhale.platform
+    if not plat or not plat.Parent then
+        EventState.NewYearsWhale.CreatePlatform()
+        plat = EventState.NewYearsWhale.platform
+        if not plat then return end
+    end
+    
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    
+    -- Keep platform under player XZ, but use locked Y (no vertical drift)
+    local pos = hrp.Position
+    local lockedY = EventState.NewYearsWhale.platformLockedY
+    if not lockedY then
+        -- If no locked Y yet, use current HRP-based Y
+        lockedY = pos.Y - EventState.NewYearsWhale.PLATFORM_OFFSET_Y
+        EventState.NewYearsWhale.platformLockedY = lockedY
+    end
+    plat.CFrame = CFrame.new(pos.X, lockedY, pos.Z)
+end
+
+-- Destroy platform
+EventState.NewYearsWhale.DestroyPlatform = function()
+    if EventState.NewYearsWhale.platform then
+        pcall(function()
+            EventState.NewYearsWhale.platform:Destroy()
+        end)
+        EventState.NewYearsWhale.platform = nil
+    end
+    EventState.NewYearsWhale.platformLockedY = nil
+end
+
+-- Update status UI
+EventState.NewYearsWhale.UpdateStatus = function(text)
+    EventState.NewYearsWhale.statusText = text
+    if EventState.NewYearsWhale.uiParagraph then
+        EventState.NewYearsWhale.uiParagraph:SetDesc("Status: " .. text)
+    end
+end
+
+-- Start the whale monitor
+EventState.NewYearsWhale.Start = function()
+    if EventState.NewYearsWhale.connection then return end
+    EventState.NewYearsWhale.enabled = true
+    EventState.NewYearsWhale.stagingPhase = false
+    EventState.NewYearsWhale.CreatePlatform()
+    EventState.NewYearsWhale.UpdateStatus("Starting...")
+    
+    local RS = Services.RunService or game:GetService("RunService")
+    local lastCheck = 0
+    
+    EventState.NewYearsWhale.connection = RS.Heartbeat:Connect(function()
+        if not EventState.NewYearsWhale.enabled then return end
+        
+        local now = tick()
+        if now - lastCheck < 0.5 then return end  -- 2 checks/sec
+        lastCheck = now
+        
+        local state = EventState.NewYearsWhale
+        
+        -- Update platform XZ (maintains locked Y, no vertical drift)
+        state.UpdatePlatformXZ()
+        
+        -- Get character
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            state.UpdateStatus("No character")
+            return
+        end
+        
+        -- Get event CFrame (may be nil if streamed out)
+        local eventCF = state.GetEventCFrame()
+        local countdown = state.GetCountdown()
+        
+        -- v3.0.1: Streaming-safe caching
+        if eventCF then
+            -- Event visible: update cache, clear staging
+            state.cachedCFrame = eventCF
+            state.lastSeenAt = now
+            state.stagingPhase = false
+        end
+        if countdown then
+            state.cachedCountdown = countdown
+        end
+        
+        -- Determine effective CFrame to use
+        local effectiveCF = eventCF or state.cachedCFrame
+        local effectiveCountdown = countdown or state.cachedCountdown or "???"
+        local isUsingCache = (not eventCF) and state.cachedCFrame
+        
+        -- v3.0.2: Fisherman Island staging when event not visible and no cache
+        if not effectiveCF then
+            -- Event never seen - need to stage at Fisherman Island to trigger replication
+            local stagingCooldownOK = (now - state.lastStagingAt) > state.STAGING_COOLDOWN
+            
+            if stagingCooldownOK and not state.stagingPhase then
+                state.stagingPhase = true
+                state.lastStagingAt = now
+                state.UpdateStatus("🚢 Staging at Fisherman Island...")
+                
+                -- Teleport to Fisherman Island
+                local stagingPos = state.FISHERMAN_CFRAME.Position
+                hrp.CFrame = CFrame.new(stagingPos.X, stagingPos.Y + 5, stagingPos.Z)
+                
+                -- Set platform at staging location
+                state.SetPlatformPosition(stagingPos.X, stagingPos.Y + 5, stagingPos.Z)
+                return
+            elseif state.stagingPhase then
+                state.UpdateStatus("🚢 Waiting for event to load...")
+                return
+            else
+                state.UpdateStatus("Event not found. Staging in " .. 
+                    math.ceil(state.STAGING_COOLDOWN - (now - state.lastStagingAt)) .. "s")
+                return
+            end
+        end
+        
+        -- Event found or cached - check grace period for cache
+        if isUsingCache then
+            local elapsed = now - state.lastSeenAt
+            if elapsed > state.MISSING_GRACE_SECONDS then
+                -- Cache expired - need re-staging
+                state.cachedCFrame = nil
+                state.UpdateStatus("Event lost. Re-staging...")
+                return
+            end
+        end
+        
+        local playerPos = hrp.Position
+        local eventPos = effectiveCF.Position
+        local distToEvent = (playerPos - eventPos).Magnitude
+        
+        -- Check if event moved significantly from last teleport position
+        local eventMoved = false
+        if state.lastEventCF then
+            local drift = (eventPos - state.lastEventCF.Position).Magnitude
+            if drift > state.MOVE_THRESHOLD then
+                eventMoved = true
+            end
+        else
+            eventMoved = true  -- First run
+        end
+        
+        -- Teleport if: far from event OR event moved, and cooldown passed
+        local needTeleport = distToEvent > 20 or eventMoved
+        local cooldownOK = (now - state.lastTeleportAt) > state.TELEPORT_COOLDOWN
+        
+        if needTeleport and cooldownOK then
+            -- Teleport above event with vertical offset
+            local targetY = eventPos.Y + state.TELEPORT_OFFSET_Y
+            local targetCF = CFrame.new(eventPos.X, targetY, eventPos.Z)
+            hrp.CFrame = targetCF
+            
+            -- Set platform at teleport destination (lock Y)
+            state.SetPlatformPosition(eventPos.X, targetY, eventPos.Z)
+            
+            state.lastTeleportAt = now
+            state.lastEventCF = effectiveCF
+        else
+            state.lastEventCF = effectiveCF
+        end
+        
+        -- Update status with countdown + streaming indicator
+        if isUsingCache then
+            state.UpdateStatus("🐋 " .. effectiveCountdown .. " (cached)")
+        else
+            state.UpdateStatus("🐋 Countdown: " .. effectiveCountdown)
+        end
+    end)
+end
+
+-- Stop the whale monitor
+EventState.NewYearsWhale.Stop = function()
+    local wasActive = EventState.NewYearsWhale.enabled and EventState.NewYearsWhale.cachedCFrame
+    local wasAssist = EventState.NewYearsWhale.assistMode  -- v3.0.5: Track if was assist
+    
+    EventState.NewYearsWhale.enabled = false
+    EventState.NewYearsWhale.stagingPhase = false
+    EventState.NewYearsWhale.assistMode = false  -- v3.0.5: Clear assist flag
+    EventState.NewYearsWhale.assistStartedAt = 0
+    if EventState.NewYearsWhale.connection then
+        EventState.NewYearsWhale.connection:Disconnect()
+        EventState.NewYearsWhale.connection = nil
+    end
+    EventState.NewYearsWhale.DestroyPlatform()
+    EventState.NewYearsWhale.lastEventCF = nil
+    EventState.NewYearsWhale.cachedCFrame = nil
+    EventState.NewYearsWhale.cachedCountdown = nil
+    EventState.NewYearsWhale.lastSeenAt = 0
+    EventState.NewYearsWhale.lastTeleportAt = 0
+    EventState.NewYearsWhale.lastStagingAt = 0
+    EventState.NewYearsWhale.UpdateStatus("Stopped")
+    
+    -- v3.0.3: Return to base point after disabling (only if was actively tracking)
+    -- v3.0.5: Skip return-to-base if was in assist mode (rotation handles navigation)
+    if wasActive and not wasAssist then
+        task.delay(0.5, function()
+            -- Use SmartReturnToTarget which is defined later, so we call via pcall
+            local ok = pcall(function()
+                SmartReturnToTarget("NewYearsWhale disabled")
+            end)
+            if not ok then
+                -- Fallback: direct teleport to base if SmartReturnToTarget not available
+                local baseName = SavedSettings.basePointName
+                if baseName and baseName ~= "None" and EventState.BASE_POINTS[baseName] then
+                    local char = LocalPlayer.Character
+                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local basePos = EventState.BASE_POINTS[baseName]
+                        hrp.CFrame = CFrame.new(basePos + Vector3.new(0, 5, 0))
+                    end
+                end
+            end
+        end)
+    end
+end
+
+-- v3.0.5: Start assist mode for rotation (lightweight start without return-to-base)
+EventState.NewYearsWhale.StartAssist = function()
+    -- Already running (user-enabled or assist)? Just flag assist
+    if EventState.NewYearsWhale.enabled then
+        return true
+    end
+    
+    EventState.NewYearsWhale.assistMode = true
+    EventState.NewYearsWhale.assistStartedAt = tick()
+    EventState.NewYearsWhale.Start()  -- Start the full monitor
+    return true
+end
+
+-- v3.0.5: Stop assist mode (only stops if started by assist)
+EventState.NewYearsWhale.StopAssist = function()
+    if not EventState.NewYearsWhale.assistMode then
+        return  -- Not in assist mode, don't stop user-enabled monitor
+    end
+    
+    -- Clear assist flags first so Stop() doesn't do return-to-base
+    EventState.NewYearsWhale.assistMode = false
+    EventState.NewYearsWhale.assistStartedAt = 0
+    
+    -- Minimal cleanup: stop monitor but don't return-to-base
+    EventState.NewYearsWhale.enabled = false
+    EventState.NewYearsWhale.stagingPhase = false
+    if EventState.NewYearsWhale.connection then
+        EventState.NewYearsWhale.connection:Disconnect()
+        EventState.NewYearsWhale.connection = nil
+    end
+    EventState.NewYearsWhale.DestroyPlatform()
+    -- Keep cache intact for rotation's final teleport
+    EventState.NewYearsWhale.UpdateStatus("Assist stopped")
+end
+
+-- v3.0.5: Check if cache is ready for rotation
+EventState.NewYearsWhale.IsCacheReady = function()
+    local cache = EventState.NewYearsWhale.cachedCFrame
+    if not cache then return false end
+    
+    -- Check if cache is still valid (within grace period)
+    local age = tick() - EventState.NewYearsWhale.lastSeenAt
+    return age < EventState.NewYearsWhale.MISSING_GRACE_SECONDS
+end
 
 --====================================
 -- AUTO RUIN DOOR (v2.8)
@@ -4560,14 +5039,139 @@ local RotationState = {
         ["Kohana"] = Vector3.new(-616, 3, 567),
         ["Christmas Island"] = Vector3.new(1154, 23, 1573),
         ["Ancient Ruin"] = Vector3.new(6052, -586, 4715),
+        -- v3.0.3: New Years 2026 Event (dynamic, updated by guard)
+        ["New Years 2026"] = Vector3.new(0, 0, 0), -- Placeholder, updated dynamically
     },
-    LOCATION_NAMES = {"Crater Island", "Kohana", "Christmas Island", "Ancient Ruin"},
+    LOCATION_NAMES = {"Crater Island", "Kohana", "Christmas Island", "Ancient Ruin", "New Years 2026"},
     GUARDS = {
         ["Ancient Ruin"] = function()
             return IsRuinDoorOpen()
         end,
+        -- v3.0.9: New Years 2026 guard is defined AFTER table to fix upvalue issue
     },
 }
+
+-- v3.0.9: New Years 2026 guard - MUST be defined after RotationState exists
+-- (Defining inside the table literal causes nil reference because RotationState
+-- doesn't exist yet during table construction)
+RotationState.GUARDS["New Years 2026"] = function()
+    -- VERSION MARKER: v3.0.9
+    if CONFIG.DEBUG then
+        print("[Guard] New Years 2026 v3.0.9 invoked")
+    end
+    
+    local state = EventState.NewYearsWhale
+    if not state then return false end
+    
+    local now = tick()
+    
+    -- Priority 1: Cache is ready - use it (ACCESSIBLE)
+    if state.cachedCFrame and state.lastSeenAt then
+        local age = now - state.lastSeenAt
+        local graceSeconds = state.MISSING_GRACE_SECONDS or 30
+        if age < graceSeconds then
+            local pos = state.cachedCFrame.Position
+            if pos then
+                RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, pos.Y + 10, pos.Z)
+                return true
+            end
+        end
+    end
+    
+    -- Priority 2: Try to get live event CFrame directly (ACCESSIBLE)
+    if state.GetEventCFrame then
+        local eventCF = nil
+        pcall(function() eventCF = state.GetEventCFrame() end)
+        if eventCF and typeof(eventCF) == "CFrame" then
+            local pos = eventCF.Position
+            if pos then
+                RotationState.LOCATIONS["New Years 2026"] = Vector3.new(pos.X, pos.Y + 10, pos.Z)
+                state.cachedCFrame = eventCF
+                state.lastSeenAt = now
+                return true
+            end
+        end
+    end
+    
+    -- Event not visible - start assist mode to trigger staging
+    if not state.enabled and state.StartAssist then
+        pcall(function()
+            state.StartAssist()
+            if CONFIG.DEBUG then
+                print("[Rotation] New Years 2026: Started assist mode for staging")
+            end
+        end)
+    end
+    
+    -- Check if assist is timing out (INACCESSIBLE after timeout)
+    if state.assistMode and state.assistStartedAt and state.assistStartedAt > 0 then
+        local assistAge = now - state.assistStartedAt
+        local timeout = state.ASSIST_TIMEOUT or 60
+        if assistAge > timeout then
+            if state.StopAssist then
+                pcall(state.StopAssist)
+            end
+            if CONFIG.DEBUG then
+                print("[Rotation] New Years 2026: Assist timed out, skipping")
+            end
+            return false  -- Timed out, allow skip
+        end
+    end
+    
+    -- Set staging destination for rotation to use
+    local fishermanCF = state.FISHERMAN_CFRAME
+    if fishermanCF and typeof(fishermanCF) == "CFrame" then
+        local fishermanPos = fishermanCF.Position
+        if fishermanPos then
+            RotationState.LOCATIONS["New Years 2026"] = Vector3.new(fishermanPos.X, fishermanPos.Y + 5, fishermanPos.Z)
+        end
+    end
+    
+    -- Return PENDING - don't skip, rotation should wait
+    return "PENDING"
+end
+
+-- v3.0.8: Unified guard invocation helper (avoids duplicated logic)
+-- Returns: status ("ok"/"pending"/"skip"/"error"), position or nil, errorMsg or nil
+RotationState.InvokeGuard = function(locationName)
+    local guard = RotationState.GUARDS and RotationState.GUARDS[locationName]
+    
+    -- No guard = accessible
+    if not guard then
+        return "ok", RotationState.LOCATIONS[locationName], nil
+    end
+    
+    -- Guard exists but isn't a function
+    if type(guard) ~= "function" then
+        local errMsg = "guard is " .. type(guard) .. ", not function"
+        if CONFIG.DEBUG then
+            print("[Rotation] " .. locationName .. " guard error: " .. errMsg)
+        end
+        return "error", nil, errMsg
+    end
+    
+    -- Invoke guard with pcall
+    local ok, result = pcall(guard)
+    
+    if not ok then
+        -- pcall failed - result is the error message
+        local errMsg = tostring(result)
+        if CONFIG.DEBUG then
+            print("[Rotation] " .. locationName .. " guard threw: " .. errMsg)
+        end
+        return "error", nil, errMsg
+    end
+    
+    -- Guard returned successfully
+    if result == "PENDING" then
+        return "pending", RotationState.LOCATIONS[locationName], nil
+    elseif result == true then
+        return "ok", RotationState.LOCATIONS[locationName], nil
+    else
+        -- false or nil = skip
+        return "skip", nil, nil
+    end
+end
 
 -- v2.7: Sync rotation index from basePointName on startup
 -- This ensures rotation continues from where basePointName is set
@@ -4603,12 +5207,14 @@ local function GetEnabledRotationLocations()
 end
 
 -- Get next rotation location (round-robin with guard check)
+-- v3.0.6: Supports PENDING guard state (wait, don't skip)
 local function GetNextRotationLocation()
     local enabled = GetEnabledRotationLocations()
     if #enabled == 0 then return nil, nil end
     
     local startIndex = RotationState.currentLocationIndex
     local attempts = 0
+    local hasPending = false  -- Track if any location is PENDING
     
     while attempts < #enabled do
         RotationState.currentLocationIndex = (RotationState.currentLocationIndex % #enabled) + 1
@@ -4630,31 +5236,62 @@ local function GetNextRotationLocation()
             print("[Rotation] Base point synced to: " .. locationName)
         end
         
-        -- Check location guard (if exists)
-        local guard = RotationState.GUARDS and RotationState.GUARDS[locationName]
-        if guard then
-            local isAccessible = false
-            pcall(function() isAccessible = guard() end)
-            
-            if not isAccessible then
+        -- Check location guard using unified helper
+        -- v3.0.8: Use InvokeGuard helper for consistent handling
+        local guardStatus, guardPos, guardErr = RotationState.InvokeGuard(locationName)
+        
+        if guardStatus == "error" then
+            if CONFIG.DEBUG then
+                print("[Rotation] Skipping " .. locationName .. " (guard error: " .. tostring(guardErr) .. ")")
+            end
+            attempts = attempts + 1
+            continue
+        end
+        
+        if guardStatus == "pending" then
+            if CONFIG.DEBUG then
+                print("[Rotation] " .. locationName .. " is PENDING (staging in progress)")
+            end
+            hasPending = true
+            return locationName, guardPos
+        end
+        
+        if guardStatus == "skip" then
+            if CONFIG.DEBUG then
+                print("[Rotation] Skipping " .. locationName .. " (locked/inaccessible)")
+            end
+            attempts = attempts + 1
+            continue
+        end
+        
+        -- guardStatus == "ok" - accessible
+        
+        -- v3.0.5: Stop assist mode if moving away from New Years 2026
+        if locationName ~= "New Years 2026" then
+            local state = EventState.NewYearsWhale
+            if state and state.assistMode and state.StopAssist then
+                state.StopAssist()
                 if CONFIG.DEBUG then
-                    print("[Rotation] Skipping " .. locationName .. " (locked/inaccessible)")
+                    print("[Rotation] Stopped New Years assist (moving to " .. locationName .. ")")
                 end
-                attempts = attempts + 1
-                continue
             end
         end
         
         return locationName, RotationState.LOCATIONS[locationName]
     end
     
-    -- All locations locked/inaccessible
+    -- All locations locked/inaccessible (but not if any was PENDING)
+    if hasPending then
+        -- Don't print "all inaccessible" if something is pending
+        return nil, nil
+    end
     if CONFIG.DEBUG then print("[Rotation] All locations inaccessible") end
     return nil, nil
 end
 
 -- Get CURRENT rotation target (not next - used by unified nav)
 -- Returns: position, name of current rotation location (based on index)
+-- v3.0.8: Uses unified InvokeGuard helper
 local function GetCurrentRotationTargetImpl()
     local enabled = GetEnabledRotationLocations()
     if #enabled == 0 then return nil, nil end
@@ -4667,31 +5304,23 @@ local function GetCurrentRotationTargetImpl()
     
     local locationName = enabled[idx]
     
-    -- Check guard for current location
-    local guard = RotationState.GUARDS and RotationState.GUARDS[locationName]
-    if guard then
-        local isAccessible = false
-        pcall(function() isAccessible = guard() end)
-        
-        if not isAccessible then
-            -- Current location locked, try to find any accessible one
-            for i, name in ipairs(enabled) do
-                local g = RotationState.GUARDS and RotationState.GUARDS[name]
-                if not g then
-                    return RotationState.LOCATIONS[name], name
-                else
-                    local ok = false
-                    pcall(function() ok = g() end)
-                    if ok then
-                        return RotationState.LOCATIONS[name], name
-                    end
-                end
-            end
-            return nil, nil -- All locked
+    -- Check guard for current location using unified helper
+    local guardStatus, guardPos, _ = RotationState.InvokeGuard(locationName)
+    
+    -- Handle accessible or pending (both return position)
+    if guardStatus == "ok" or guardStatus == "pending" then
+        return guardPos, locationName
+    end
+    
+    -- Handle inaccessible (error or skip) - try to find any accessible one
+    for i, name in ipairs(enabled) do
+        local status, pos, _ = RotationState.InvokeGuard(name)
+        if status == "ok" or status == "pending" then
+            return pos, name
         end
     end
     
-    return RotationState.LOCATIONS[locationName], locationName
+    return nil, nil -- All locked
 end
 
 -- Assign to forward declaration (declared in Unified Navigation System)
@@ -6064,8 +6693,10 @@ local function StartChristmasCaveMonitor(uiParagraph)
     local RS = Services.RunService or game:GetService("RunService")
     if not RS then return end
     
-    -- Throttle to 1 check per second (was 60/s with RenderStepped)
+    -- v2.9: Object-based detection (replaces time-based)
     local lastChristmasCheck = 0
+    local hasTeleportedThisSession = false  -- Prevent spam teleports
+    
     EventState.christmasCaveConn = RS.Heartbeat:Connect(function()
         if not SavedSettings.autoJoinChristmasCave then return end
         
@@ -6073,67 +6704,82 @@ local function StartChristmasCaveMonitor(uiParagraph)
         if now - lastChristmasCheck < 1 then return end
         lastChristmasCheck = now
         
-        local nowUTC = NowUTC()
-        local nowT = os.date("!*t", nowUTC)
+        -- v2.9: Use object-based detection (method on EventState)
+        local caveStatus = EventState.GetChristmasCaveStatus()
+        local wasActive = EventState.christmasCaveActive
+        local newState = caveStatus.state
         
-        -- START EVENT (UTC, minute 00)
-        if EventState.CHRISTMAS_HOURS[nowT.hour] and nowT.min == 0 and not EventState.christmasCaveActive then
+        -- Handle state transitions
+        if caveStatus.isActive and not wasActive then
+            -- TRANSITION: closed/loading → active
             SaveCurrentPosition()
             EventState.christmasCaveActive = true
-            EventState.christmasCaveStartUTC = nowUTC
-            EventState.isInEventZone = true  -- Anti-loop flag
+            EventState.caveActiveSince = tick()
+            EventState.caveLastState = "active"
+            EventState.isInEventZone = true
+            hasTeleportedThisSession = false  -- Reset for new event
             
-            -- Pause rotation if active (Scenario 1)
+            -- Pause rotation if active
             if RotationState and RotationState.isActive then
                 PauseRotation("Christmas Cave event")
             end
             
-            -- v2.7.2: Use VerifiedTeleport with callback (same as Lochness)
-            VerifiedTeleport(EventState.COORDS.ChristmasCave, function()
-                if CONFIG.DEBUG then log("[Event] Teleported to Christmas Cave") end
-                WindUI:Notify({Title = "Christmas Cave", Content = "Teleported to event!", Duration = 3})
-                
-                -- Run 9x totem if enabled (Scenario 1 & 2) - v2.6.2: smart polling
-                if SavedSettings.autoTotemAfterTeleport then
-                    task.delay(1, function()
-                        StartAutoTotemPolling("Christmas Cave event")
-                    end)
-                end
-            end)
-        end
-        
-        -- STOP EVENT (after duration)
-        if EventState.christmasCaveActive and (nowUTC - EventState.christmasCaveStartUTC >= EventState.CHRISTMAS_DURATION) then
-            EventState.christmasCaveActive = false
-            EventState.isInEventZone = false  -- Clear anti-loop flag
+            -- Teleport to cave (only once per event)
+            if not hasTeleportedThisSession then
+                hasTeleportedThisSession = true
+                VerifiedTeleport(EventState.COORDS.ChristmasCave, function()
+                    if CONFIG.DEBUG then log("[Event] Teleported to Christmas Cave (object-detected)") end
+                    WindUI:Notify({Title = "Christmas Cave", Content = "Event detected! Teleported.", Duration = 3})
+                    
+                    if SavedSettings.autoTotemAfterTeleport then
+                        task.delay(1, function()
+                            StartAutoTotemPolling("Christmas Cave event")
+                        end)
+                    end
+                end)
+            end
             
-            -- v2.6: Use unified navigation to return to correct target
+        elseif not caveStatus.isActive and wasActive and newState == "closed" then
+            -- TRANSITION: active → closed
+            EventState.christmasCaveActive = false
+            EventState.caveActiveSince = nil
+            EventState.caveLastState = "closed"
+            EventState.isInEventZone = false
+            hasTeleportedThisSession = false
+            
             if RotationState and RotationState.isPaused then
-                -- Resume rotation (which will teleport to rotation location)
                 ResumeRotation()
             else
-                -- Use unified system to determine correct target
                 SmartReturnToTarget("Christmas Cave event ended")
             end
-            if CONFIG.DEBUG then log("[Event] Christmas Cave event ended, returned") end
+            if CONFIG.DEBUG then log("[Event] Christmas Cave closed (object-detected)") end
         end
+        
+        -- Update state tracking
+        EventState.caveLastState = newState
         
         -- UI UPDATE
         if uiParagraph then
-            if EventState.christmasCaveActive then
-                local remaining = EventState.CHRISTMAS_DURATION - (nowUTC - EventState.christmasCaveStartUTC)
-                uiParagraph:SetDesc("🎄 EVENT ACTIVE\nRemaining: " .. FormatHMS(remaining))
+            if newState == "loading" then
+                uiParagraph:SetDesc("⏳ Loading... (Map not streamed)")
+            elseif newState == "active" then
+                local timeLeftStr = "Unknown"
+                if caveStatus.timeLeftSeconds then
+                    timeLeftStr = FormatHMS(caveStatus.timeLeftSeconds)
+                end
+                uiParagraph:SetDesc("🎄 EVENT ACTIVE\nTime Left: " .. timeLeftStr)
             else
+                -- closed - show next scheduled time
                 local nextTs = GetNextChristmasCaveEvent()
                 if nextTs then
+                    local nowUTC = NowUTC()
                     uiParagraph:SetDesc(string.format(
-                        "Next Event:\nServer (UTC): %s\nLocal: %s\nCountdown: %s",
+                        "Cave Closed\nNext (UTC): %s\nCountdown: %s",
                         FormatHM(nextTs, true),
-                        FormatHM(nextTs, false),
                         FormatHMS(nextTs - nowUTC)
                     ))
                 else
-                    uiParagraph:SetDesc("Next Event: --:--")
+                    uiParagraph:SetDesc("Cave Closed\nNext: --:--")
                 end
             end
         end
@@ -6146,6 +6792,8 @@ local function StopChristmasCaveMonitor()
         EventState.christmasCaveConn = nil
     end
     EventState.christmasCaveActive = false
+    EventState.caveActiveSince = nil
+    EventState.caveLastState = "closed"
     EventState.isInEventZone = false
     -- v2.6: Use unified navigation
     SmartReturnToTarget("Christmas monitor stopped")
@@ -6393,6 +7041,30 @@ EventsTab:Button({
                 Content = "No presents found in inventory",
                 Duration = 3
             })
+        end
+    end
+})
+
+-- Auto New Years Whale Section (v3.0)
+EventsTab:Divider()
+EventsTab:Section({Title = "New Years Whale (v3.0)", TextSize = 16})
+
+EventState.NewYearsWhale.uiParagraph = EventsTab:Paragraph({
+    Title = "New Years Whale Status",
+    Content = "Status: " .. EventState.NewYearsWhale.statusText,
+})
+
+EventsTab:Toggle({
+    Title = "Auto New Years Whale",
+    Desc = "Follow the 2026 Event and stay on a platform. Shows countdown.",
+    Value = SavedSettings.autoNewYearsWhaleEnabled or false,
+    Callback = function(state)
+        SavedSettings.autoNewYearsWhaleEnabled = state
+        SaveSettings()
+        if state then
+            EventState.NewYearsWhale.Start()
+        else
+            EventState.NewYearsWhale.Stop()
         end
     end
 })
